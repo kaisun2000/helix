@@ -112,7 +112,7 @@ public class TestP2PNoDuplicatedMessage extends ZkTestBase {
           REPLICA_NUMBER - 1, 1000000L, CrushEdRebalanceStrategy.class.getName());
     }
 
-    // start  controller
+    // start controller
     _controller = new ClusterControllerManager(ZK_ADDR, CLUSTER_NAME, _controllerName);
     _controller.syncStart();
 
