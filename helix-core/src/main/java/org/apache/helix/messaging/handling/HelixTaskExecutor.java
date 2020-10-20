@@ -1121,10 +1121,8 @@ public class HelixTaskExecutor implements MessageListener, TaskExecutor {
     String error = "Message " + message.getMsgId() + " cannot be processed: " + message.getRecord();
     if (exception != null) {
       LOG.error(error, exception);
-      _statusUpdateUtil.logError(message, HelixStateMachineEngine.class, exception, error, manager);
     } else {
       LOG.error(error + errorMsg);
-      _statusUpdateUtil.logError(message, HelixStateMachineEngine.class, errorMsg, manager);
     }
     message.setMsgState(MessageState.UNPROCESSABLE);
     removeMessageFromZK(accessor, message, instanceName);
