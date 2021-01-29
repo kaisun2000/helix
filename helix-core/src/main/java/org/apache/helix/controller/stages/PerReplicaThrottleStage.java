@@ -2,6 +2,7 @@ package org.apache.helix.controller.stages;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -17,6 +18,7 @@ import org.apache.helix.controller.common.ResourcesStateMap;
 import org.apache.helix.controller.dataproviders.ResourceControllerDataProvider;
 import org.apache.helix.controller.pipeline.AbstractBaseStage;
 import org.apache.helix.controller.pipeline.StageException;
+import org.apache.helix.model.ClusterConfig;
 import org.apache.helix.model.IdealState;
 import org.apache.helix.model.Message;
 import org.apache.helix.model.Partition;
@@ -192,7 +194,6 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
 
     Map<Partition, Map<String, Integer>> expectedStateCountByPartition = new HashMap<>();
     Map<Partition, Map<String, Integer>> currentStateCountsByPartition = new HashMap<>();
-    // TODO: later PRs
     // Step 1: charge existing pending messages and update retraced state map.
     chargePendingMessages(resource, throttleController, currentStateOutput, bestPossibleStateOutput,
         idealState, cache, partitionsNeedRecovery, partitionsWithErrorStateReplica,
@@ -222,7 +223,42 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
         throttledRecoveryMessages, StateTransitionThrottleConfig.RebalanceType.RECOVERY_BALANCE);
 
     // Step 4: sorts load message list and applies throttling
-    // TODO: next PR
+
+    // TODO: consider simplifying the following logic.
+    // calculate error-on-recovery downward flag
+    // If the threshold (ErrorOrRecovery) is set, then use it, if not, then check if the old
+    // threshold (Error) is set. If the old threshold is set, use it. If not, use the default value
+    // for the new one. This is for backward-compatibility
+    int threshold = 1; // Default threshold for ErrorOrRecoveryPartitionThresholdForLoadBalance
+    int partitionCount = partitionsWithErrorStateReplica.size();
+    ClusterConfig clusterConfig = cache.getClusterConfig();
+    if (clusterConfig.getErrorOrRecoveryPartitionThresholdForLoadBalance() != -1) {
+      // ErrorOrRecovery is set
+      threshold = clusterConfig.getErrorOrRecoveryPartitionThresholdForLoadBalance();
+      partitionCount += partitionsNeedRecovery.size(); // Only add this count when the threshold is set
+    } else {
+      if (clusterConfig.getErrorPartitionThresholdForLoadBalance() != 0) {
+        // 0 is the default value so the old threshold has been set
+        threshold = clusterConfig.getErrorPartitionThresholdForLoadBalance();
+      }
+    }
+
+    // Perform regular load balance only if the number of partitions in recovery and in error is
+    // less than the threshold. Otherwise, only allow downward-transition load balance
+    boolean onlyDownwardLoadBalance = partitionCount > threshold;
+    Set<Message> throttledLoadMessages = new HashSet<>();
+    LogUtil.logDebug(logger, _eventId,
+        String.format("applying load rebalance with resource %s, onlyDownwardLoadBalance %s",
+            resourceName, onlyDownwardLoadBalance));
+    applyThrottling(resource, throttleController, currentStateMap, bestPossibleMap, idealState,
+        cache, onlyDownwardLoadBalance, loadMessages, messagePartitionMap, throttledLoadMessages,
+        StateTransitionThrottleConfig.RebalanceType.LOAD_BALANCE);
+
+    LogUtil.logDebug(logger, _eventId,
+        String.format("resource %s, throttled recovery message: %s", resourceName,throttledRecoveryMessages));
+    LogUtil.logDebug(logger, _eventId,
+        String.format("resource %s, throttled load messages: %s", resourceName,throttledLoadMessages));
+
     // Step 5: construct output
     Map<Partition, List<Message>> outMessagesByPartition = new HashMap<>();
     for (Partition partition : resource.getPartitions()) {
@@ -316,6 +352,26 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
     propagateCountsTopDown(stateModelDef, currentStateCountsOut);
   }
 
+  private void chargePendingMessageAndRetrace(
+      List<Message> messages,
+      Map<String, String> retracedStateMap,
+      String resourceName,
+      StateTransitionThrottleController throttleController,
+      StateTransitionThrottleConfig.RebalanceType rType
+  ) {
+    for (Message msg: messages) {
+      String toState = msg.getToState();
+      String toInstance = msg.getTgtName();
+      // toInstance should be in currentStateMap
+      retracedStateMap.put(toInstance, toState);
+
+      throttleController.chargeInstance(rType, toInstance);
+      throttleController.chargeCluster(rType);
+      throttleController.chargeResource(rType, resourceName);
+      logger.trace("throttleControllerstate->{} after pending {} charge msg:{}", throttleController, rType.name(), msg);
+    }
+  }
+
   /*
    * Charge pending messages with recovery or load rebalance and update the retraced partition map
    * accordingly.
@@ -357,7 +413,51 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
       expectedStateCountByPartition.put(partition, expectedStateCountMap);
       currentStateCountsByPartition.put(partition, currentStateCounts);
 
-      // TODO: the core logic in next PR
+      Map<String, Message> pendingMessageMap =
+          currentStateOutput.getPendingMessageMap(resourceName, partition);
+      List<Message> pendingMessages = new ArrayList<>(pendingMessageMap.values());
+      String stateModelDefName = idealState.getStateModelDefRef();
+      StateModelDefinition stateModelDef = cache.getStateModelDef(stateModelDefName);
+
+      // sort pendingMessages based on transition priority then timeStamp for state transition message
+      pendingMessages.sort(new PartitionMessageComparator(stateModelDef));
+      List<Message> recoveryMessages = new ArrayList<>();
+      List<Message> loadMessages = new ArrayList<>();
+      for (Message msg : pendingMessages) {
+        if (!Message.MessageType.STATE_TRANSITION.name().equals(msg.getMsgType())) {
+          // ignore cancellation message etc. For now, don't charge them.
+          continue;
+        }
+        String toState = msg.getToState();
+        if (toState.equals(HelixDefinedState.DROPPED.name()) || toState
+            .equals(HelixDefinedState.ERROR.name())) {
+          continue;
+        }
+
+        Integer expectedCount = expectedStateCountMap.get(toState);
+        Integer currentCount = currentStateCounts.get(toState);
+        expectedCount = expectedCount == null ? 0 : expectedCount;
+        currentCount = currentCount == null ? 0 : currentCount;
+
+        boolean isUpward = !isDownwardTransition(idealState, cache, msg);
+        if (isUpward && (currentCount < expectedCount)) {
+          recoveryMessages.add(msg);
+          partitionsNeedRecovery.add(partition);
+          // update
+          currentStateCounts.put(toState, currentCount + 1);
+        } else {
+          loadMessages.add(msg);
+        }
+      }
+      // charge recovery message and retrace
+      chargePendingMessageAndRetrace(recoveryMessages, retracedStateMap, resourceName,
+          throttleController, StateTransitionThrottleConfig.RebalanceType.RECOVERY_BALANCE);
+      // charge load message and retrace;
+      // note if M->S with relay message, we don't charge relay message now. We would charge relay
+      // message only when it shows in pending messages in the next cycle of controller run.
+      chargePendingMessageAndRetrace(loadMessages, retracedStateMap, resourceName,
+          throttleController, StateTransitionThrottleConfig.RebalanceType.LOAD_BALANCE);
+      retracedPartitionsStateMap.put(partition, retracedStateMap);
     }
   }
 
@@ -562,6 +662,152 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
         logger.warn(
             String.format("Invalid priority field %s for resource %s", priority, _resourceName));
       }
+    }
+  }
+
+  // compare message for throttling, note, all these message are of type state_transition: how about upward, downward?
+  // recovery are all upward
+  // 1) toState priority (toTop is higher than toSecond)
+  // 2) same toState, the message classification time, the less required toState meeting minActive requirement has higher priority
+  // 3) Higher priority for the partition of messages with fewer replicas with states matching with bestPossible ??? do we need this one
+  private static class MessageThrottleComparator implements Comparator<Message> {
+    private Map<Partition, Map<String, String>> _bestPossibleMap;
+    private Map<Partition, Map<String, String>> _currentStateMap;
+    private Map<Message, Partition> _messagePartitionMap;
+    StateModelDefinition _stateModelDef;
+    private boolean _recoveryRebalance;
+
+    MessageThrottleComparator(Map<Partition, Map<String, String>> bestPossibleMap,
+        Map<Partition, Map<String, String>> currentStateMap,
+        Map<Message, Partition> messagePartitionMap, StateModelDefinition stateModelDef,
+        boolean recoveryRebalance) {
+      _bestPossibleMap = bestPossibleMap;
+      _currentStateMap = currentStateMap;
+      _recoveryRebalance = recoveryRebalance;
+      _messagePartitionMap = messagePartitionMap;
+      _stateModelDef = stateModelDef;
+    }
+
+    @Override
+    public int compare(Message o1, Message o2) {
+      if (_recoveryRebalance) {
+        Map<String, Integer> statePriorityMap = _stateModelDef.getStatePriorityMap();
+        Integer toStateP1 = statePriorityMap.get(o1.getToState());
+        Integer toStateP2 = statePriorityMap.get(o2.getToState());
+        // higher priority for topState
+        if (!toStateP1.equals(toStateP2)) {
+          return toStateP1.compareTo(toStateP2);
+        }
+      }
+      Partition p1 = _messagePartitionMap.get(o1);
+      Partition p2 = _messagePartitionMap.get(o2);
+      // Higher priority for the partition with fewer active replicas
+      int currentActiveReplicas1 = getCurrentActiveReplicas(p1);
+      int currentActiveReplicas2 = getCurrentActiveReplicas(p2);
+      if (currentActiveReplicas1 != currentActiveReplicas2) {
+        return Integer.compare(currentActiveReplicas1, currentActiveReplicas2);
+      }
+      // Higher priority for the partition with fewer replicas with states matching with IdealState
+      int idealStateMatched1 = getIdealStateMatched(p1);
+      int idealStateMatched2 = getIdealStateMatched(p2);
+      if (idealStateMatched1 != idealStateMatched2) {
+        return Integer.compare(idealStateMatched1, idealStateMatched2);
+      }
+      // finally lexical order of partiton name + replica name
+      String name1 = o1.getPartitionName() + o1.getTgtName();
+      String name2 = o2.getPartitionName() + o2.getTgtName();
+      return name1.compareTo(name2);
+    }
+
+    private int getIdealStateMatched(Partition partition) {
+      int matchedState = 0;
+      if (!_currentStateMap.containsKey(partition)) {
+        return matchedState;
+      }
+      for (String instance : _bestPossibleMap.get(partition).keySet()) {
+        if (_bestPossibleMap.get(partition).get(instance)
+            .equals(_currentStateMap.get(partition).get(instance))) {
+          matchedState++;
+        }
+      }
+      return matchedState;
+    }
+
+    private int getCurrentActiveReplicas(Partition partition) {
+      int currentActiveReplicas = 0;
+      if (!_currentStateMap.containsKey(partition)) {
+        return currentActiveReplicas;
+      }
+      // Initialize state -> number of this state map
+      Map<String, Integer> stateCountMap = new HashMap<>();
+      for (String state : _bestPossibleMap.get(partition).values()) {
+        if (!stateCountMap.containsKey(state)) {
+          stateCountMap.put(state, 0);
+        }
+        stateCountMap.put(state, stateCountMap.get(state) + 1);
+      }
+      // Search the state map
+      for (String state : _currentStateMap.get(partition).values()) {
+        if (stateCountMap.containsKey(state) && stateCountMap.get(state) > 0) {
+          currentActiveReplicas++;
+          stateCountMap.put(state, stateCountMap.get(state) - 1);
+        }
+      }
+      return currentActiveReplicas;
+    }
+  }
+
+  private static class PartitionMessageComparator implements Comparator<Message> {
+    private StateModelDefinition _stateModelDef;
+
+    PartitionMessageComparator(StateModelDefinition stateModelDef) {
+      _stateModelDef = stateModelDef;
+    }
+
+    @Override
+    public int compare(Message o1, Message o2) {
+
+      Map<String, Integer> stateTransitionPriorities = getStateTransitionPriorityMap(_stateModelDef);
+
+      Integer priority1 = Integer.MAX_VALUE;
+      if (Message.MessageType.STATE_TRANSITION.name().equals(o1.getMsgType())) {
+        String fromState1 = o1.getFromState();
+        String toState1 = o1.getToState();
+        String transition1 = fromState1 + "-" + toState1;
+
+        if (stateTransitionPriorities.containsKey(transition1)) {
+          priority1 = stateTransitionPriorities.get(transition1);
+        }
+      }
+
+      Integer priority2 = Integer.MAX_VALUE;
+      if (Message.MessageType.STATE_TRANSITION.name().equals(o1.getMsgType())) {
+        String fromState2 = o1.getFromState();
+        String toState2 = o1.getToState();
+        String transition2 = fromState2 + "-" + toState2;
+
+        if (stateTransitionPriorities.containsKey(transition2)) {
+          priority2 = stateTransitionPriorities.get(transition2);
+        }
+      }
+
+      if (!priority1.equals(priority2)) {
+        return priority1.compareTo(priority2);
+      }
+
+      Long p1 = o1.getCreateTimeStamp();
+      Long p2 = o2.getCreateTimeStamp();
+      return p1.compareTo(p2);
+    }
+
+    private Map<String, Integer> getStateTransitionPriorityMap(StateModelDefinition stateModelDef) {
+      Map<String, Integer> stateTransitionPriorities = new HashMap<String, Integer>();
+      List<String> stateTransitionPriorityList = stateModelDef.getStateTransitionPriorityList();
+      for (int i = 0; i < stateTransitionPriorityList.size(); i++) {
+        stateTransitionPriorities.put(stateTransitionPriorityList.get(i), i);
+      }
+
+      return stateTransitionPriorities;
     }
   }
 
