@@ -271,15 +271,44 @@ public class PerReplicaThrottleStage extends AbstractBaseStage {
         if (throttledRecoveryMessages.contains(message)) {
           continue;
         }
+        if (throttledLoadMessages.contains(message)) {
+          continue;
+        }
         finalPartitionMessages.add(message);
       }
       outMessagesByPartition.put(partition, finalPartitionMessages);
       output.addMessages(resourceName, partition, finalPartitionMessages);
     }
+
     // Step 6: constructs all retraced partition state map for the resource
-    // TODO: next PR
+    constructRetracedPartitionStateMap(resource, retracedPartitionsStateMap, outMessagesByPartition);
+
     // Step 7: emit metrics
     // TODO: next PR
+  }
+
+  private void constructRetracedPartitionStateMap(Resource resource,
+      Map<Partition, Map<String, String>> retracedPartitionsStateMap,
+      Map<Partition, List<Message>> outMessagesByPartition) {
+    for (Partition partition : resource.getPartitions()) {
+      List<Message> partitionMessages = outMessagesByPartition.get(partition);
+      if (partitionMessages == null) {
+        continue;
+      }
+      for (Message message : partitionMessages) {
+        if (!Message.MessageType.STATE_TRANSITION.name().equals(message.getMsgType())) {
+          // todo: log?
+          // ignore cancellation message etc.
+          continue;
+        }
+        String toState = message.getToState();
+        // toIntance may not be in the retracedStateMap as so far it is current state based.
+        // new instance in best possible not in currentstate would not be in retracedStateMap yet.
+        String toInstance = message.getTgtName();
+        Map<String, String> retracedStateMap = retracedPartitionsStateMap.get(partition);
+        retracedStateMap.put(toInstance, toState);
+      }
+    }
   }
 
   private void propagateCountsTopDown(
